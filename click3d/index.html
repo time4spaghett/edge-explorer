@@ -1,0 +1,94 @@
+<!doctype html>
+<!-- 3D plotly chart that reports clicks back to the Streamlit page (Alex 2026-11-10: "if I click on a point in the
+map, can I get the list of ideas to open below"). Streamlit's own plotly_chart does not report clicks on 3D charts.
+Speaks the Streamlit component protocol directly (postMessage), so no build step or npm package is needed.
+Glide (Alex 2026-11-10: "the fade/blink makes it really hard to track the change ... can we smooth"): when a new
+figure has the same shape as the one on screen (the Over time play-through), the sheet and the dots move to their
+new heights over GLIDE_MS instead of jumping; then the new figure is drawn in full. -->
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>html, body {margin: 0; padding: 0; background: transparent; overflow: hidden;} #plot {width: 100%;}</style>
+</head>
+<body>
+<div id="plot"></div>
+<script>
+const GLIDE_MS = 1200;
+const send = (type, data) => window.parent.postMessage(Object.assign({isStreamlitMessage: true, type}, data), "*");
+let drawn = null, shown = null, camera = null, wired = false, gliding = 0;
+
+const num = (v) => (v === null || v === undefined || Number.isNaN(v)) ? null : v;
+function sameShape(a, b) {
+  if (!a || !b || a.data.length !== b.data.length) return false;
+  for (let i = 0; i < a.data.length; i++) {
+    const p = a.data[i], q = b.data[i];
+    if (p.type !== q.type) return false;
+    if (p.type === "surface" && (!p.z || !q.z || p.z.length !== q.z.length || p.z[0].length !== q.z[0].length)) return false;
+    if (p.type === "scatter3d" && p.mode === "markers" && (p.z || []).length !== (q.z || []).length) return false;
+  }
+  return true;
+}
+function mix(a, b, t) {  // blend two numbers (or rows / grids of numbers); a blank end takes the other end's value
+  if (Array.isArray(b)) return b.map((v, i) => mix(a ? a[i] : null, v, t));
+  const x = num(a), y = num(b);
+  if (y === null) return x === null ? null : (t < 1 ? x : null);
+  if (x === null) return y;
+  return x + (y - x) * t;
+}
+function glide(el, from, to, done) {
+  const id = ++gliding, t0 = performance.now();
+  const idx = [], zs = [], cs = [];
+  to.data.forEach((tr, i) => {
+    if (tr.type === "surface" || (tr.type === "scatter3d" && tr.mode === "markers")) idx.push(i);
+  });
+  function frame(now) {
+    if (id !== gliding) return;
+    const u = Math.min(1, (now - t0) / GLIDE_MS), t = u < .5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
+    const z = [], extra = {surfacecolor: [], "marker.color": []};
+    idx.forEach((i) => {
+      const a = from.data[i], b = to.data[i];
+      z.push(mix(a.z, b.z, t));
+      extra.surfacecolor.push(b.type === "surface" ? mix(a.surfacecolor, b.surfacecolor, t) : undefined);
+      extra["marker.color"].push(b.marker && Array.isArray(b.marker.color) ? mix(a.marker.color, b.marker.color, t)
+                                                                            : (b.marker ? b.marker.color : undefined));
+    });
+    Plotly.restyle(el, Object.assign({z}, extra), idx);
+    if (u < 1) requestAnimationFrame(frame); else done();
+  }
+  requestAnimationFrame(frame);
+}
+
+window.addEventListener("message", (e) => {
+  if (!e.data || e.data.type !== "streamlit:render") return;
+  const args = e.data.args, h = args.height || 720;
+  const el = document.getElementById("plot");
+  el.style.height = h + "px";
+  if (drawn !== args.fig) {
+    const fig = JSON.parse(args.fig);
+    if (camera) fig.layout.scene = Object.assign(fig.layout.scene || {}, {camera});  // keep the viewer's angle
+    const draw = () => Plotly.react(el, fig.data, fig.layout, {displaylogo: false, responsive: true});
+    if (shown && sameShape(shown, fig)) {
+      glide(el, shown, fig, draw);
+    } else {
+      gliding++;
+      draw();
+    }
+    shown = fig;
+    drawn = args.fig;
+    if (!wired) {
+      wired = true;
+      el.on("plotly_click", (ev) => {
+        const p = ev.points && ev.points[0];
+        if (!p) return;
+        send("streamlit:setComponentValue", {value: {x: p.x, y: p.y, n: Date.now()}, dataType: "json"});
+      });
+      el.on("plotly_relayout", (r) => { if (r["scene.camera"]) camera = r["scene.camera"]; });
+    }
+  }
+  send("streamlit:setFrameHeight", {height: h});
+});
+send("streamlit:componentReady", {apiVersion: 1});
+</script>
+</body>
+</html>
